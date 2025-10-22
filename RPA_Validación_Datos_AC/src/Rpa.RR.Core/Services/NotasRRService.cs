@@ -9,6 +9,7 @@ using DocumentFormat.OpenXml.Spreadsheet;
 using Microsoft.Extensions.Configuration;
 using Microsoft.IdentityModel.Tokens;
 using RPA_Validación_Datos_AC.src.Rpa.RR.Core.Utilities;
+using RPA_Validación_Datos_AC.src.Rpa.RR.Infrastructure.Repositories;
 using RPAExtraccionNotasRR.src.Rpa.RR.Core.Entities;
 using RPAExtraccionNotasRR.src.Rpa.RR.Core.Utilities;
 using RPAExtraccionNotasRR.src.Rpa.RR.Helpers;
@@ -28,6 +29,7 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
     {
         private readonly CasoRepository _casoRepo;
         private readonly CredencialesRepository _credencialesRepo;
+        private readonly ActualizarCasoRepository _actualizarCasoRepo;
         private readonly IEmailSender _emailSender;
         private readonly string _clave;
         private readonly int _maxLoginAttempts;
@@ -40,12 +42,14 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
         public NotasRRService(
             CasoRepository casoRepo,
             CredencialesRepository credencialesRepo,
+            ActualizarCasoRepository actualizarCasoRepo,
             IEmailSender emailSender,
             IConfiguration config
             ) 
         {
             _casoRepo = casoRepo;
             _credencialesRepo = credencialesRepo;
+            _actualizarCasoRepo = actualizarCasoRepo;
             _emailSender = emailSender;
             _clave = config["Ac:Clave"]; 
             _maxLoginAttempts = config.GetValue<int>("RetryPolicy:MaxAttempts", 3);
@@ -57,7 +61,7 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
             log.Escribir("Iniciando RPA de Validación Datos AC...");
 
             _casoRepo.ResetFallidos(); // Reiniciar casos fallidos
-
+            //_actualizarCasoRepo.InsertarDetalle(618731);
             //const int APLICATIVO_ID = 3024;  // Pon aquí el Id que corresponda
             // 2) Obtener credenciales de la base de datos
             log.Escribir("Obteniendo credenciales de la base de datos...");
@@ -70,7 +74,7 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
 
             clave = _clave;
 
-            //RRHelperService RRHelper = new RRHelperService();
+            ACHelperService ACHelper = new ACHelperService();
 
             CasoDto caso = new CasoDto();
 
@@ -84,6 +88,29 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
             string identificacion = string.Empty;
             string correo = string.Empty;
             string celular = string.Empty;
+            bool BusquedaCuscode = false;
+
+            // Lista de remitentes que deben ir a atención manual (todo en minúsculas, sin espacios)
+            var blockedSenders = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "solucionespqr@conexionescelulares.com",
+                "conexpqrleticia@conexionescelulares.com",
+                "cpsarauca@datosmoviles.net",
+                "1servicioalclientepqr@gmail.com",
+                "barracpsinirida@movilco.com.co",
+                "barracvssanjose@movilco.com.co",
+                "barracpscarreno@movilco.com.co",
+                "coordinadorapuertoasis@jesmarcomunicaciones.com",
+                "contactenos@sic.gov.co",
+                "notificacionesclaro@claro.com.co",
+                "pqrstrasladogobierno@claro.com.co",
+                "comunicacioncrccare@crcom.gov.co",
+                "radicador2@claro.com.co",
+                "cpsinirida@movilco.co"
+            };
+            string remitente = string.Empty;
+            string remitenteNorm = string.Empty;
+            bool CuscodeValido = false;
 
             bool datosExtraidos = false;
             int tabular = 0;
@@ -110,9 +137,59 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
                         log.Escribir("No hay casos pendientes para procesar. Finalizando ejecución.");
                         Console.WriteLine("No hay casos pendientes para procesar. Finalizando ejecución.");
                         log.finalizar();
-                       
+
+                        string Kill = @"
+                                try 
+                                {
+                                    RunWait, taskkill /f /im ""AC Administrador de Clientes.exe""
+                                }
+                                catch e
+                                {
+                                    ; Manejo de errores si es necesario
+                                }
+                            ";
+                        try
+                        {
+                            ahk.ExecRaw(Kill.ToString());
+                            Thread.Sleep(2000);
+                            var resultado = ahk.GetVar("result");
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"Error al ejecutar el script: {ex.Message}");
+                            throw new AHKException($"Error: de AHK .", ex);
+                        }
+
                         Environment.Exit(0); // Terminar el programa si no hay casos pendientes
                         break; // No hay más casos pendientes, salir del bucle
+                    }
+
+                    _casoRepo.IncrementarIntento(caso.Id_Lecturabilidad);
+
+                    // Obtener el remitente a comprobar 
+                    remitente = (caso.CorreoaNotificar ?? string.Empty).Trim();
+
+                    // Normalizar: bajar a minúsculas y eliminar espacios laterales
+                    remitenteNorm = remitente.ToLowerInvariant();
+
+                    // Si el remitente está en la lista -> NO insertar
+                    if (!string.IsNullOrEmpty(remitente) && blockedSenders.Contains(remitenteNorm))
+                    {
+                        log.Escribir($"Remitente bloqueado detectado para Id {caso.Id_Lecturabilidad}: {remitente} -> No se insertará en DetalleLecturabilidad. Atención manual requerida.");
+                        Console.WriteLine($"Remitente bloqueado ({remitente}) — se omite InsertarDetalle para Id {caso.Id_Lecturabilidad}.");
+
+                        // marcar el caso para revisión manual en lugar de dejarlo como EXITOSO.
+
+                        _casoRepo.ActualizarEstado(
+                            caso.Id_Lecturabilidad,
+                            nuevoEstado: "RECHAZADO",
+                            observaciones: $"Remitente bloqueado ({remitente}). Atención manual requerida.",
+                            ExtraccionCompleta: caso.ExtraccionCompleta
+                        );
+                        log.Escribir($"Caso {caso.Id_Lecturabilidad} marcado como PENDIENTE_MANUAL por remitente bloqueado.");
+
+                        goto BuscarCaso;
+                        //  salimos del flujo de inserción.
                     }
 
                     if (caso.Cuscode == "0" && caso.Identificacion == "0")
@@ -121,18 +198,6 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
                                     caso.Id_Lecturabilidad,
                                     nuevoEstado: "RECHAZADO",
                                     observaciones: $"Caso Rechazado por datos incompletos",
-                                    ExtraccionCompleta: caso.ExtraccionCompleta
-                                );
-
-                        goto BuscarCaso;
-                    }
-
-                    if (caso.Cuscode != "0" && caso.DirigidoA != "0" && caso.Identificacion != "0" && caso.CorreoaNotificar != "0")
-                    {
-                        _casoRepo.ActualizarEstado(
-                                    caso.Id_Lecturabilidad,
-                                    nuevoEstado: "RECHAZADO",
-                                    observaciones: $"Caso ya cuenta con datos completos",
                                     ExtraccionCompleta: caso.ExtraccionCompleta
                                 );
 
@@ -156,6 +221,50 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
                             throw;
                         }
                     }
+
+                    if (!string.IsNullOrEmpty(caso.Cuscode) && caso.Cuscode != "0" && caso.Cuscode != ""
+                        && !string.IsNullOrEmpty(caso.DirigidoA) && caso.DirigidoA != "0" && caso.DirigidoA != ""
+                        && !string.IsNullOrEmpty(caso.Identificacion) && caso.Identificacion != "0" && caso.Identificacion != ""
+                        && !string.IsNullOrEmpty(caso.CorreoaNotificar) && caso.CorreoaNotificar != "0" && caso.CorreoaNotificar != "")
+                    {
+
+                        string cus = caso.Cuscode;
+                        BusquedaCuscode = ACHelper.IsValidCuscode(cus);
+
+                        if (BusquedaCuscode)
+                        {
+                            log.Escribir("Caso ya cuenta con datos completos");
+                            Console.WriteLine("Caso ya cuenta con datos completos");
+                            caso.ExtraccionCompleta = true;
+
+                            _casoRepo.ActualizarEstado(
+                                caso.Id_Lecturabilidad,
+                                nuevoEstado: "EXITOSO",
+                                observaciones: $"Caso ya cuenta con datos completos",
+                                ExtraccionCompleta: caso.ExtraccionCompleta
+                            );
+                            log.Escribir($"Caso: {caso.Id_Lecturabilidad} marcado como EXITOSO.");
+                            Thread.Sleep(2000);
+
+                            // remitente NO bloqueado -> proceder con la inserción
+                            try
+                            {
+                                int filas = _actualizarCasoRepo.InsertarDetalle(caso.Id_Lecturabilidad);
+                                Console.WriteLine($"InsertarDetalle: filas afectadas = {filas}");
+                                log.Escribir($"InsertarDetalle: filas afectadas = {filas}");
+                                goto BuscarCaso;
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine("Fallo InsertarDetalle: " + ex.Message);
+                                log.Escribir("Fallo InsertarDetalle: " + ex.Message);
+                                throw;
+                            }
+                            
+                        }
+                    }
+                    
+                    
 
                     caso.ExtraccionCompleta = false;
                     bool procesoCompleto = false; // Inicializar como falso
@@ -316,13 +425,22 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
                                 throw new ACException($"Error: De login AC.", ex);
                             }
 
+                            string cus = caso.Cuscode;
+                            if (!string.IsNullOrEmpty(caso.Cuscode) && caso.Cuscode != "" && caso.Cuscode != "0")
+                            {
+                                BusquedaCuscode = ACHelper.IsValidCuscode(cus);
+                            } 
+
                             // consulta de suscriptor 
-                            if (caso.Cuscode != "0")
+                            if (BusquedaCuscode)
                             {
                                 // consulta de suscriptor por Custcode
                                 Thread.Sleep(3000);
                                 string Consulta = $@"
                                             global result
+                                            lineaEncontrada := 0  ; 0 = No encontrada, 1 = Encontrada
+                                            validacion := 0
+
                                             try
 	                                            {{
 		                                            WinActivate, ""AC Administración de Clientes""
@@ -398,12 +516,68 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
 			                                            throw Exception(""Image Not Found: img_BuscarCUN"")
 		                                            }}
 
+                                                    ;comprobar cuenta
+                                                    Img := RutaImagenGlobal . ""No_Existe_Informacion.PNG""
+                                                    ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, %Img%
+                                                    if (ErrorLevel = 0) {{
+                                                        ; imagen encontrada -> devolver estado y no continuar
+                                                        result := ""No_Existe_Informacion""
+                                                        ;MsgBox, No_Existe_Informacion
+                                                        return
+                                                    }} 
+
 		                                            Sleep, 3000
 		                                            ;~ Damos click en ""Cuenta"" Primera fila
 		                                            MouseMove, 390, 135
 		                                            Sleep, 600
 		                                            MouseClick, Left, 390, 135, 1
-		                                            Sleep, 3000
+		                                            Sleep, 5000
+
+                                                    ; Comprobar si la linea es Prepago
+                                                    Imagen := RutaImagenGlobal . ""Prepago.PNG""
+                                                    ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, %Imagen%
+                                                    if (ErrorLevel = 0)
+                                                    {{
+                                                        ; Imagen encontrada: establecer la bandera y CONTINUAR el script
+                                                        lineaEncontrada := 1
+    
+                                                        ;MsgBox, Línea de Prepago detectada. Continuando...
+                                                    }}
+                                                    Sleep, 3000
+
+                                                    if (lineaEncontrada = 0)
+                                                    {{
+                                                        ; Comprobar si la linea es Postpago
+                                                        Imagen := RutaImagenGlobal . ""Postpago.PNG""
+                                                        ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, %Imagen%
+                                                        if (ErrorLevel = 0)
+                                                        {{
+                                                            ; Imagen encontrada: establecer la bandera y CONTINUAR el script
+                                                            lineaEncontrada := 1
+                                                            ;MsgBox, Línea de Postpago detectada. Continuando...
+                                                        }}
+                                                    }}
+
+                                                    Sleep, 3000
+
+                                                    if (lineaEncontrada = 0)
+                                                    {{
+                                                        ; Si la bandera sigue en 0, ninguna de las dos imágenes fue encontrada.
+                                                        result := ""FALLO: Tipo de línea no detectado (ni Prepago ni Postpago).""
+                                                        ;MsgBox, Fallo: No se detectó ni Prepago ni Postpago. Saliendo del script.
+                                                        return ; Detiene la ejecución del script aquí y retorna
+                                                    }}
+
+                                                    ;Comprobar si la linea esta desactivada
+                                                    Img2 := RutaImagenGlobal . ""Linea_Desactivada.PNG""
+                                                    ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, %Img2%
+                                                    if (ErrorLevel = 0) {{
+                                                        ; imagen encontrada -> devolver estado y no continuar
+                                                        result := ""Linea_Desactivada""
+                                                        ;MsgBox, Linea_Desactivada
+                                                        return
+                                                    }} 
+                                                    Sleep, 3000
 
 		                                            ;~ Damos click en ""Cuenta"" Primera fila
 		                                            MouseMove, 390, 305
@@ -440,152 +614,176 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
 
 		                                            Sleep, 5000
 
-		                                            If !FileExist(""C:\Desarrollos-BI\ImagenesRobots\img_AceptarLineaProceso.PNG"")
-		                                            {{
-			                                            throw Exception(""Image Doesn't Exist: img_AceptarLineaProceso.PNG"")
-		                                            }}
-		
-		                                            ;quitar mensajes informativos 
-		                                              ;por si sale mensaje de confirmacion 
-		                                            Send, {{Enter}}
-                                                    Sleep, 3000
-                                                    Send, {{Enter}}
-                                                    Sleep, 3000
-                                                    Send, {{Enter}}		
-		                                            Sleep, 3000
+		                                            ;If !FileExist(""C:\Desarrollos-BI\ImagenesRobots\img_AceptarLineaProceso.PNG"")
+		                                            ;{{
+			                                            ;throw Exception(""Image Doesn't Exist: img_AceptarLineaProceso.PNG"")
+		                                            ;}}
 		
 
-		                                            Loop, 120
-		                                            {{
-			                                            WinActivate, ""AC Administración de Clientes""
-			                                            Sleep, 500
+		                                            ;Loop, 120
+		                                            ;{{
+			                                           ; WinActivate, ""AC Administración de Clientes""
+			                                            ;Sleep, 500
 
-			                                            CoordMode, Pixel, Window
-			                                            ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, C:\Desarrollos-BI\ImagenesRobots\img_AceptarLineaProceso.PNG
-			                                            If ErrorLevel = 0
-			                                            {{
-				                                            Click, %FoundX%, %FoundY% Left, 1
-				                                            Sleep, 2000
-				                                            Break
-			                                            }}
-			                                            else
-			                                            {{
-				                                            Break
-			                                            }}
-			                                            Sleep, 1000
-		                                            }}
+			                                            ;CoordMode, Pixel, Window
+			                                            ;ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, C:\Desarrollos-BI\ImagenesRobots\img_AceptarLineaProceso.PNG
+			                                            ;If ErrorLevel = 0
+			                                            ;{{
+				                                           ; Click, %FoundX%, %FoundY% Left, 1
+				                                           ; Sleep, 2000
+				                                           ; Break
+			                                            ;}}
+			                                            ;else
+			                                            ;{{
+				                                           ; Break
+			                                            ;}}
+			                                            ;Sleep, 1000
+		                                            ;}}
 
+                                                    Sleep, 2000
+
+                                                    ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, C:\Desarrollos-BI\ImagenesRobots\ValidacionBarrio.PNG
+			                                        If ErrorLevel = 0
+			                                        {{
+				                                            ;Click, %FoundX%, %FoundY% Left, 1
+                                                            validacion := 1
+                                                            Sleep, 2000
+                                                            Send, {{Enter}}
+				                                            Sleep, 3000  
+				                                            
+			                                        }}
+			                                         
+			                                        Sleep, 2000
 
 		                                            If !FileExist(""C:\Desarrollos-BI\ImagenesRobots\img_BotonAceptarCampoBarrio.PNG"")
 		                                            {{
 			                                            throw Exception(""Image Doesn't Exist: img_BotonAceptarCampoBarrio.PNG"")
 		                                            }}
 
-		                                            Loop, 30
-		                                            {{
-			                                            WinActivate, ""Validación Barrio""
-			                                            Sleep, 500
-
-			                                            CoordMode, Pixel, Window
-			                                            ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, C:\Desarrollos-BI\ImagenesRobots\img_BotonAceptarCampoBarrio.PNG
+                                                    if (validacion = 1)
+                                                    {{
+                                                        ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, C:\Desarrollos-BI\ImagenesRobots\img_BotonAceptarCampoBarrio.PNG
 			                                            If ErrorLevel = 0
 			                                            {{
-				                                            Click, %FoundX%, %FoundY% Left, 1
-				                                            Sleep, 2000
-				                                            Break
+				                                                ;Click, %FoundX%, %FoundY% Left, 1
+                                                                Send, {{Enter}}
+				                                                Sleep, 2000
+                                                                Send, {{Tab 36}}
+                                                                Sleep, 3000
+				                                            
 			                                            }}
-			                                            else
-			                                            {{
-				                                            Break
-			                                            }}
+			                                         
 			                                            Sleep, 1000
-		                                            }}
-
-
-		                                            If !FileExist(""C:\Desarrollos-BI\ImagenesRobots\img_CiudadDptoIncorrectos.PNG"")
-		                                            {{
-			                                            throw Exception(""Image Doesn't Exist: img_CiudadDptoIncorrectos.PNG"")
-		                                            }}
-
-		                                            Loop, 30
-		                                            {{
-			                                            WinActivate, ""Validación Ciudad/Departamento""
-			                                            Sleep, 500
-
-			                                            CoordMode, Pixel, Window
-			                                            ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, C:\Desarrollos-BI\ImagenesRobots\img_CiudadDptoIncorrectos.PNG
+                                                    }}
+                                                    else 
+                                                    {{
+                                                        ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, C:\Desarrollos-BI\ImagenesRobots\img_BotonAceptarCampoBarrio.PNG
 			                                            If ErrorLevel = 0
 			                                            {{
-				                                            Click, %FoundX%, %FoundY% Left, 1
-				                                            Sleep, 2000
-				                                            Break
+				                                                ;Click, %FoundX%, %FoundY% Left, 1
+                                                                Send, {{Enter}}
+				                                                Sleep, 2000
+                                                                Send, {{Tab 37}}
+                                                                Sleep, 3000
+				                                            
 			                                            }}
-			                                            else
-			                                            {{
-				                                            Break
-			                                            }}
+			                                         
 			                                            Sleep, 1000
-		                                            }}
+                                                    }}     	                                            
 
-		                                            If !FileExist(""C:\Desarrollos-BI\ImagenesRobots\img_BotonAceptarFechaCum.PNG"")
-		                                            {{
-			                                            throw Exception(""Image Doesn't Exist: img_BotonAceptarFechaCum.PNG"")
-		                                            }}
+                                                    ;quitar mensajes informativos 
+		                                              ;por si sale mensaje de confirmacion 
+		                                            ;Send, {{Enter}}
+                                                    ;Sleep, 3000
+                                                    ;Send, {{Enter}}
+                                                    ;Sleep, 3000
+                                                    ;Send, {{Enter}}		
+		                                            ;Sleep, 3000
 
-		                                            Loop, 30
-		                                            {{
-			                                            WinActivate, ""AC Administración de Clientes""
-			                                            Sleep, 500
+		                                            ;If !FileExist(""C:\Desarrollos-BI\ImagenesRobots\img_CiudadDptoIncorrectos.PNG"")
+		                                            ;{{
+			                                            ;throw Exception(""Image Doesn't Exist: img_CiudadDptoIncorrectos.PNG"")
+		                                            ;}}
 
-			                                            CoordMode, Pixel, Window
-			                                            ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, C:\Desarrollos-BI\ImagenesRobots\img_BotonAceptarFechaCum.PNG
-			                                            If ErrorLevel = 0
-			                                            {{
-				                                            Click, %FoundX%, %FoundY% Left, 1
-				                                            Sleep, 2000
-				                                            Break
-			                                            }}
+		                                            ;Loop, 30
+		                                            ;{{
+			                                            ;WinActivate, ""Validación Ciudad/Departamento""
+			                                           ; Sleep, 500
+
+			                                            ;CoordMode, Pixel, Window
+			                                            ;ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, C:\Desarrollos-BI\ImagenesRobots\img_CiudadDptoIncorrectos.PNG
+			                                            ;If ErrorLevel = 0
+			                                            ;{{
+				                                            ;Click, %FoundX%, %FoundY% Left, 1
+				                                            ;Sleep, 2000
+				                                            ;Break
+			                                            ;}}
+			                                            ;else
+			                                            ;{{
+				                                            ;Break
+			                                            ;}}
+			                                            ;Sleep, 1000
+		                                            ;}}
+
+		                                            ;If !FileExist(""C:\Desarrollos-BI\ImagenesRobots\img_BotonAceptarFechaCum.PNG"")
+		                                            ;{{
+			                                            ;throw Exception(""Image Doesn't Exist: img_BotonAceptarFechaCum.PNG"")
+		                                            ;}}
+
+		                                            ;Loop, 30
+		                                            ;{{
+			                                            ;WinActivate, ""AC Administración de Clientes""
+			                                            ;Sleep, 500
+
+			                                            ;CoordMode, Pixel, Window
+			                                            ;ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, C:\Desarrollos-BI\ImagenesRobots\img_BotonAceptarFechaCum.PNG
+			                                            ;If ErrorLevel = 0
+			                                            ;{{
+				                                            ;Click, %FoundX%, %FoundY% Left, 1
+				                                            ;Sleep, 2000
+				                                            ;Break
+			                                            ;}}
 			                                            else
-			                                            {{
-				                                            Break
-			                                            }}
-			                                            Sleep, 1000
-		                                            }}
+			                                            ;{{
+				                                            ;Break
+			                                            ;}}
+			                                            ;Sleep, 1000
+		                                            ;}}
 
 
-		                                            If !FileExist(""C:\Desarrollos-BI\ImagenesRobots\img_FalloConexionBD.PNG"")
-		                                            {{
-			                                            throw Exception(""Image Doesn't Exist: img_FalloConexionBD.PNG"")
-		                                            }}
+		                                            ;If !FileExist(""C:\Desarrollos-BI\ImagenesRobots\img_FalloConexionBD.PNG"")
+		                                            ;{{
+			                                            ;throw Exception(""Image Doesn't Exist: img_FalloConexionBD.PNG"")
+		                                            ;}}
 
-		                                            Loop, 30
-		                                            {{
-			                                            WinActivate, ""AC Administración de Clientes""
-			                                            Sleep, 500
+		                                            ;Loop, 30
+		                                            ;{{
+			                                            ;WinActivate, ""AC Administración de Clientes""
+			                                            ;Sleep, 500
 
-			                                            CoordMode, Pixel, Window
-			                                            ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, C:\Desarrollos-BI\ImagenesRobots\img_FalloConexionBD.PNG
-			                                            If ErrorLevel = 0
-			                                            {{
+			                                            ;CoordMode, Pixel, Window
+			                                            ;ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, C:\Desarrollos-BI\ImagenesRobots\img_FalloConexionBD.PNG
+			                                            ;If ErrorLevel = 0
+			                                            ;{{
 				                                            ;MsgBox, encuentra Imagen img_FalloConexionBD
-				                                            Send, {{Enter}}
-				                                            Sleep, 2000
-				                                            Break
-			                                            }}
-			                                            else
-			                                            {{
-				                                            Break
-			                                            }}
-			                                            Sleep, 1000
-		                                            }}
+				                                            ;Send, {{Enter}}
+				                                            ;Sleep, 2000
+				                                            ;Break
+			                                            ;}}
+			                                            ;else
+			                                            ;{{
+				                                            ;Break
+			                                            ;}}
+			                                            ;Sleep, 1000
+		                                            ;}}
 
-		                                            Resultado := Estado
+		                                            result := ""OK""
 		                                            ;MsgBox, Valor variable Resultado %Resultado%
 
 	                                            }}
 	                                            catch e
 	                                            {{
-		                                            Resultado := ""(AHK "" e.What "": "" e.Line "") "" e.Message
+		                                            result := ""(AHK "" e.What "": "" e.Line "") "" e.Message
 	                                            }}
 
 	                                            return
@@ -625,6 +823,57 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
                                     {
                                         log.Escribir("Error critico! Al ejecutar script ahk");
                                         throw new AHKException($"Error: fallo al ejecutar AHK.");
+                                    }
+                                    else if (result.Contains("No_Existe_Informacion"))
+                                    {
+                                        log.Escribir("No existe información para el Cuscode proporcionado.");
+                                        Console.WriteLine("No existe información para el Cuscode proporcionado.");
+
+                                        /*_casoRepo.ActualizarEstado(
+                                            caso.Id_Lecturabilidad,
+                                            nuevoEstado: "RECHAZADO",
+                                            observaciones: $"No existe informacion para la identificacion consultada",
+                                            ExtraccionCompleta: caso.ExtraccionCompleta
+                                        );*/
+                                        BusquedaCuscode = false;
+                                        goto BuscarCedula;
+                                    }
+                                    else if(result.Contains("Linea_Desactivada"))
+                                    {
+                                        log.Escribir("La línea asociada al Cuscode está desactivada.");
+                                        Console.WriteLine("La línea asociada al Cuscode está desactivada.");
+                                        _casoRepo.ActualizarEstado(
+                                            caso.Id_Lecturabilidad,
+                                            nuevoEstado: "RECHAZADO",
+                                            observaciones: $"La linea asociada a la Cuscode consultada esta desactivada",
+                                            ExtraccionCompleta: caso.ExtraccionCompleta
+                                        );
+                                        goto BuscarCaso;
+                                    }
+                                    else if (result.Contains("No_Tiene_Linea"))
+                                    {
+                                        log.Escribir("El Cuscode consultado no tiene línea asociada.");
+                                        Console.WriteLine("El Cuscode consultado no tiene línea asociada.");
+                                        _casoRepo.ActualizarEstado(
+                                            caso.Id_Lecturabilidad,
+                                            nuevoEstado: "RECHAZADO",
+                                            observaciones: $"El Cuscode consultado no tiene linea asociada",
+                                            ExtraccionCompleta: caso.ExtraccionCompleta
+                                        );
+                                        goto BuscarCaso;
+                                    }
+                                    else if (result.Contains("FALLO: Tipo de línea no detectado (ni Prepago ni Postpago)."))
+                                    {
+                                        log.Escribir("La línea asociada al Cuscode no tiene tipo de línea (Prepago/Postpago).");
+                                        Console.WriteLine("La línea asociada al Cuscode no tiene tipo de línea (Prepago/Postpago).");
+                                        _casoRepo.ActualizarEstado(
+                                            caso.Id_Lecturabilidad,
+                                            nuevoEstado: "RECHAZADO",
+                                            observaciones: $"La linea sin datos",
+                                            ExtraccionCompleta: caso.ExtraccionCompleta
+                                        );
+                                        goto BuscarCaso;
+
                                     }
                                     else
                                     {
@@ -680,7 +929,7 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
                                     throw new ACException($"Error: En AC.", ex);
                                 }
 
-                                if (caso.DirigidoA == "0")
+                                if (string.IsNullOrEmpty(caso.DirigidoA) || caso.DirigidoA == "0")
                                 {
                                     // Captura de nombre
                                     Thread.Sleep(3000);
@@ -831,7 +1080,7 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
 
                                 }
 
-                                if (caso.Identificacion == "0")
+                                if (string.IsNullOrEmpty(caso.Identificacion) || caso.Identificacion == "0")
                                 {
 
                                     // Captura de identicacion
@@ -965,7 +1214,7 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
                                     }
                                 }
 
-                                if (caso.CorreoaNotificar == "0")
+                                if (string.IsNullOrEmpty(caso.CorreoaNotificar) || caso.CorreoaNotificar == "0")
                                 {
                                     // Captura de correo
                                     Thread.Sleep(3000);
@@ -1113,12 +1362,18 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
                                 }
 
                             }
-                            else if (caso.Cuscode == "0" && caso.Identificacion != "0")
+
+                        BuscarCedula:
+                            if (!BusquedaCuscode && caso.Identificacion != "0" && !string.IsNullOrEmpty(caso.Identificacion))
                             {
+
                                 // consulta de suscriptor por identificacion
                                 Thread.Sleep(3000);
                                 string Consulta2 = $@"
                                             global result
+                                            lineaEncontrada := 0
+                                            validacion := 0
+
                                             try
 	                                            {{
 		                                            WinActivate, ""AC Administración de Clientes""
@@ -1193,13 +1448,71 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
 			                                            ;MsgBox, no funciona la imagen img_BuscarCUN
 			                                            throw Exception(""Image Not Found: img_BuscarCUN"")
 		                                            }}
+                                                    Sleep, 5000     
+
+                                                    ;comprobar cuenta
+                                                    Img := RutaImagenGlobal . ""No_Existe_Informacion.PNG""
+                                                    ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, %Img%
+                                                    if (ErrorLevel = 0) {{
+                                                        ; imagen encontrada -> devolver estado y no continuar
+                                                        result := ""No_Existe_Informacion""
+                                                        ;MsgBox, No_Existe_Informacion
+                                                        return
+                                                    }} 
 
 		                                            Sleep, 3000
 		                                            ;~ Damos click en ""Cuenta"" Primera fila
 		                                            MouseMove, 390, 135
 		                                            Sleep, 600
 		                                            MouseClick, Left, 390, 135, 1
-		                                            Sleep, 3000
+		                                            Sleep, 5000
+
+                                                    ; Comprobar si la linea es Prepago
+                                                    Imagen := RutaImagenGlobal . ""Prepago.PNG""
+                                                    ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, %Imagen%
+                                                    if (ErrorLevel = 0)
+                                                    {{
+                                                        ; Imagen encontrada: establecer la bandera y CONTINUAR el script
+                                                        lineaEncontrada := 1
+    
+                                                        ;MsgBox, Línea de Prepago detectada. Continuando...
+                                                    }}
+                                                    Sleep, 3000
+
+                                                    if (lineaEncontrada = 0)
+                                                    {{
+                                                        ; Comprobar si la linea es Postpago
+                                                        Imagen := RutaImagenGlobal . ""Postpago.PNG""
+                                                        ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, %Imagen%
+                                                        if (ErrorLevel = 0)
+                                                        {{
+                                                            ; Imagen encontrada: establecer la bandera y CONTINUAR el script
+                                                            lineaEncontrada := 1
+                                                            ;MsgBox, Línea de Postpago detectada. Continuando...
+                                                        }}
+                                                    }}
+
+                                                    Sleep, 3000
+
+                                                    if (lineaEncontrada = 0)
+                                                    {{
+                                                        ; Si la bandera sigue en 0, ninguna de las dos imágenes fue encontrada.
+                                                        result := ""FALLO: Tipo de línea no detectado (ni Prepago ni Postpago).""
+                                                        ;MsgBox, Fallo: No se detectó ni Prepago ni Postpago. Saliendo del script.
+                                                        return ; Detiene la ejecución del script aquí y retorna
+                                                    }}
+
+
+                                                    ;Comprobar si la linea esta desactivada
+                                                    Img2 := RutaImagenGlobal . ""Linea_Desactivada.PNG""
+                                                    ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, %Img2%
+                                                    if (ErrorLevel = 0) {{
+                                                        ; imagen encontrada -> devolver estado y no continuar
+                                                        result := ""Linea_Desactivada""
+                                                        ;MsgBox, Linea_Desactivada
+                                                        return
+                                                    }} 
+                                                    Sleep, 3000
 
 		                                            ;~ Damos click en ""Cuenta"" Primera fila
 		                                            MouseMove, 390, 305
@@ -1236,152 +1549,173 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
 
 		                                            Sleep, 5000
 
-		                                            If !FileExist(""C:\Desarrollos-BI\ImagenesRobots\img_AceptarLineaProceso.PNG"")
-		                                            {{
-			                                            throw Exception(""Image Doesn't Exist: img_AceptarLineaProceso.PNG"")
-		                                            }}
+		                                            ;If !FileExist(""C:\Desarrollos-BI\ImagenesRobots\img_AceptarLineaProceso.PNG"")
+		                                            ;{{
+			                                            ;throw Exception(""Image Doesn't Exist: img_AceptarLineaProceso.PNG"")
+		                                            ;}}
+	
 		
-		                                            ;quitar mensajes informativos 
+		                                            ;Loop, 120
+		                                            ;{{
+			                                            ;WinActivate, ""AC Administración de Clientes""
+			                                            ;Sleep, 500
+
+			                                            ;CoordMode, Pixel, Window
+			                                            ;ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, C:\Desarrollos-BI\ImagenesRobots\img_AceptarLineaProceso.PNG
+			                                            ;If ErrorLevel = 0
+			                                            ;{{
+				                                            ;Click, %FoundX%, %FoundY% Left, 1
+				                                            ;Sleep, 2000
+				                                            ;Break
+			                                            ;}}
+			                                            ;else
+			                                            ;{{
+				                                            ;Break
+			                                            ;}}
+			                                            ;Sleep, 1000
+		                                            ;}}
+
+                                                    Sleep, 2000
+
+                                                    ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, C:\Desarrollos-BI\ImagenesRobots\ValidacionBarrio.PNG
+			                                        If ErrorLevel = 0
+			                                        {{
+				                                            ;Click, %FoundX%, %FoundY% Left, 1
+                                                            validacion := 1
+                                                            Sleep, 2000
+                                                            Send, {{Enter}}
+				                                            Sleep, 3000  
+				                                            
+			                                        }}
+			                                         
+			                                        Sleep, 2000
+
+                                                    if (validacion = 1)
+                                                    {{
+                                                        ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, C:\Desarrollos-BI\ImagenesRobots\img_BotonAceptarCampoBarrio.PNG
+			                                            If ErrorLevel = 0
+			                                            {{
+				                                                ;Click, %FoundX%, %FoundY% Left, 1
+                                                                Send, {{Enter}}
+				                                                Sleep, 2000
+                                                                Send, {{Tab 36}}
+                                                                Sleep, 3000
+				                                            
+			                                            }}
+			                                         
+			                                            Sleep, 1000
+                                                    }}
+                                                    else 
+                                                    {{
+                                                        ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, C:\Desarrollos-BI\ImagenesRobots\img_BotonAceptarCampoBarrio.PNG
+			                                            If ErrorLevel = 0
+			                                            {{
+				                                                ;Click, %FoundX%, %FoundY% Left, 1
+                                                                Send, {{Enter}}
+				                                                Sleep, 2000
+                                                                Send, {{Tab 37}}
+                                                                Sleep, 3000
+				                                            
+			                                            }}
+			                                         
+			                                            Sleep, 1000
+                                                    }}
+			                                         
+			                                        Sleep, 2000
+
+                                                    ;quitar mensajes informativos 
 		                                              ;por si sale mensaje de confirmacion 
-		                                            Send, {{Enter}}
-                                                    Sleep, 3000
-                                                    Send, {{Enter}}
-                                                    Sleep, 3000
-                                                    Send, {{Enter}}		
-		                                            Sleep, 3000
-		
+		                                            ;Send, {{Enter}}
+                                                    ;Sleep, 3000
+                                                    ;Send, {{Enter}}
+                                                    ;Sleep, 3000
+                                                    ;Send, {{Enter}}		
+		                                            ;Sleep, 3000
+		                                            
+		                                            ;If !FileExist(""C:\Desarrollos-BI\ImagenesRobots\img_CiudadDptoIncorrectos.PNG"")
+		                                             ;{{
+			                                            ; throw Exception(""Image Doesn't Exist: img_CiudadDptoIncorrectos.PNG"")
+		                                             ;}}
 
-		                                            Loop, 120
-		                                            {{
-			                                            WinActivate, ""AC Administración de Clientes""
-			                                            Sleep, 500
-
-			                                            CoordMode, Pixel, Window
-			                                            ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, C:\Desarrollos-BI\ImagenesRobots\img_AceptarLineaProceso.PNG
-			                                            If ErrorLevel = 0
-			                                            {{
-				                                            Click, %FoundX%, %FoundY% Left, 1
-				                                            Sleep, 2000
-				                                            Break
-			                                            }}
-			                                            else
-			                                            {{
-				                                            Break
-			                                            }}
-			                                            Sleep, 1000
-		                                            }}
-
-
-		                                            If !FileExist(""C:\Desarrollos-BI\ImagenesRobots\img_BotonAceptarCampoBarrio.PNG"")
-		                                            {{
-			                                            throw Exception(""Image Doesn't Exist: img_BotonAceptarCampoBarrio.PNG"")
-		                                            }}
-
-		                                            Loop, 30
-		                                            {{
-			                                            WinActivate, ""Validación Barrio""
-			                                            Sleep, 500
+		                                             ;Loop, 30
+		                                            ; {{
+			                                             ;WinActivate, ""Validación Ciudad/Departamento""
+			                                             ;Sleep, 500
 
 			                                            CoordMode, Pixel, Window
-			                                            ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, C:\Desarrollos-BI\ImagenesRobots\img_BotonAceptarCampoBarrio.PNG
-			                                            If ErrorLevel = 0
-			                                            {{
-				                                            Click, %FoundX%, %FoundY% Left, 1
-				                                            Sleep, 2000
-				                                            Break
-			                                            }}
-			                                            else
-			                                            {{
-				                                            Break
-			                                            }}
-			                                            Sleep, 1000
-		                                            }}
+			                                             ;ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, C:\Desarrollos-BI\ImagenesRobots\img_CiudadDptoIncorrectos.PNG
+			                                             ;If ErrorLevel = 0
+			                                             ;{{
+				                                            ; Click, %FoundX%, %FoundY% Left, 1
+				                                            ;  Sleep, 2000
+				                                             ;Break
+			                                           ;  }}
+			                                             ;else
+			                                             ;{{
+				                                       ;       Break
+			                                           ;  }}
+			                                            ; Sleep, 1000
+		                                             ;}}
+
+		                                            ;If !FileExist(""C:\Desarrollos-BI\ImagenesRobots\img_BotonAceptarFechaCum.PNG"")
+		                                            ;{{
+			                                         ;   throw Exception(""Image Doesn't Exist: img_BotonAceptarFechaCum.PNG"")
+		                                            ;}}
+
+		                                            ;Loop, 30
+		                                            ;{{
+			                                         ;   WinActivate, ""AC Administración de Clientes""
+			                                          ;  Sleep, 500
+
+			                                           ; CoordMode, Pixel, Window
+			                                            ;ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, C:\Desarrollos-BI\ImagenesRobots\img_BotonAceptarFechaCum.PNG
+			                                            ;If ErrorLevel = 0
+			                                            ;{{
+				                                         ;   Click, %FoundX%, %FoundY% Left, 1
+				                                          ;  Sleep, 2000
+				                                           ; Break
+			                                            ;}}
+			                                            ;else
+			                                            ;{{
+				                                         ;   Break
+			                                           ; }}
+			                                            ;Sleep, 1000
+		                                           ; }}
 
 
-		                                            If !FileExist(""C:\Desarrollos-BI\ImagenesRobots\img_CiudadDptoIncorrectos.PNG"")
-		                                            {{
-			                                            throw Exception(""Image Doesn't Exist: img_CiudadDptoIncorrectos.PNG"")
-		                                            }}
+		                                           ; If !FileExist(""C:\Desarrollos-BI\ImagenesRobots\img_FalloConexionBD.PNG"")
+		                                           ; {{
+			                                      ;      throw Exception(""Image Doesn't Exist: img_FalloConexionBD.PNG"")
+		                                          ;  }}
 
-		                                            Loop, 30
-		                                            {{
-			                                            WinActivate, ""Validación Ciudad/Departamento""
-			                                            Sleep, 500
+		                                           ; Loop, 30
+		                                       ;     {{
+			                                          ;  WinActivate, ""AC Administración de Clientes""
+			                                         ;   Sleep, 500
 
-			                                            CoordMode, Pixel, Window
-			                                            ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, C:\Desarrollos-BI\ImagenesRobots\img_CiudadDptoIncorrectos.PNG
-			                                            If ErrorLevel = 0
-			                                            {{
-				                                            Click, %FoundX%, %FoundY% Left, 1
-				                                            Sleep, 2000
-				                                            Break
-			                                            }}
-			                                            else
-			                                            {{
-				                                            Break
-			                                            }}
-			                                            Sleep, 1000
-		                                            }}
-
-		                                            If !FileExist(""C:\Desarrollos-BI\ImagenesRobots\img_BotonAceptarFechaCum.PNG"")
-		                                            {{
-			                                            throw Exception(""Image Doesn't Exist: img_BotonAceptarFechaCum.PNG"")
-		                                            }}
-
-		                                            Loop, 30
-		                                            {{
-			                                            WinActivate, ""AC Administración de Clientes""
-			                                            Sleep, 500
-
-			                                            CoordMode, Pixel, Window
-			                                            ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, C:\Desarrollos-BI\ImagenesRobots\img_BotonAceptarFechaCum.PNG
-			                                            If ErrorLevel = 0
-			                                            {{
-				                                            Click, %FoundX%, %FoundY% Left, 1
-				                                            Sleep, 2000
-				                                            Break
-			                                            }}
-			                                            else
-			                                            {{
-				                                            Break
-			                                            }}
-			                                            Sleep, 1000
-		                                            }}
-
-
-		                                            If !FileExist(""C:\Desarrollos-BI\ImagenesRobots\img_FalloConexionBD.PNG"")
-		                                            {{
-			                                            throw Exception(""Image Doesn't Exist: img_FalloConexionBD.PNG"")
-		                                            }}
-
-		                                            Loop, 30
-		                                            {{
-			                                            WinActivate, ""AC Administración de Clientes""
-			                                            Sleep, 500
-
-			                                            CoordMode, Pixel, Window
-			                                            ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, C:\Desarrollos-BI\ImagenesRobots\img_FalloConexionBD.PNG
-			                                            If ErrorLevel = 0
-			                                            {{
+			                                          ;  CoordMode, Pixel, Window
+			                                          ;  ImageSearch, FoundX, FoundY, 0, 0, A_ScreenWidth, A_ScreenHeight, C:\Desarrollos-BI\ImagenesRobots\img_FalloConexionBD.PNG
+			                                          ;  If ErrorLevel = 0
+			                                           ; {{
 				                                            ;MsgBox, encuentra Imagen img_FalloConexionBD
-				                                            Send, {{Enter}}
-				                                            Sleep, 2000
-				                                            Break
-			                                            }}
-			                                            else
-			                                            {{
-				                                            Break
-			                                            }}
-			                                            Sleep, 1000
-		                                            }}
+				                                           ; Send, {{Enter}}
+				                                          ;  Sleep, 2000
+				                                          ;  Break
+			                                          ;  }}
+                                                        ;else
+			                                          ;  {{
+				                                        ;    Break
+			                                           ; }}
+			                                          ;  Sleep, 1000
+		                                           ; }}
 
-		                                            Resultado := Estado
+		                                            result := ""OK""
 		                                            ;MsgBox, Valor variable Resultado %Resultado%
 
 	                                            }}
 	                                            catch e
 	                                            {{
-		                                            Resultado := ""(AHK "" e.What "": "" e.Line "") "" e.Message
+		                                            result := ""(AHK "" e.What "": "" e.Line "") "" e.Message
 	                                            }}
 
 	                                            return
@@ -1422,6 +1756,55 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
                                         log.Escribir("Error critico! Al ejecutar script ahk");
                                         throw new AHKException($"Error: fallo al ejecutar AHK.");
                                     }
+                                    else if (result.Contains("No_Existe_Informacion"))
+                                    {
+                                        log.Escribir("No existe informacion para la identificacion consultada");
+                                        Console.WriteLine("No existe informacion para la identificacion consultada");
+                                        _casoRepo.ActualizarEstado(
+                                            caso.Id_Lecturabilidad,
+                                            nuevoEstado: "RECHAZADO",
+                                            observaciones: $"No existe informacion para la identificacion consultada",
+                                            ExtraccionCompleta: caso.ExtraccionCompleta
+                                        );
+
+                                        goto BuscarCaso;
+                                    }
+                                    else if (result.Contains("Linea_Desactivada"))
+                                    {
+                                        log.Escribir("La linea asociada a la identificacion consultada se encuentra desactivada");
+                                        Console.WriteLine("La linea asociada a la identificacion consultada se encuentra desactivada");
+                                        _casoRepo.ActualizarEstado(
+                                            caso.Id_Lecturabilidad,
+                                            nuevoEstado: "RECHAZADO",
+                                            observaciones: $"La linea asociada a la identificacion consultada se encuentra desactivada",
+                                            ExtraccionCompleta: caso.ExtraccionCompleta
+                                        );
+                                        goto BuscarCaso;
+                                    }
+                                    else if (result.Contains("No_Tiene_Linea"))
+                                    {
+                                        log.Escribir("La identificacion consultada no tiene linea asociada");
+                                        Console.WriteLine("La identificacion consultada no tiene linea asociada");
+                                        _casoRepo.ActualizarEstado(
+                                            caso.Id_Lecturabilidad,
+                                            nuevoEstado: "RECHAZADO",
+                                            observaciones: $"La identificacion consultada no tiene linea asociada",
+                                            ExtraccionCompleta: caso.ExtraccionCompleta
+                                        );
+                                        goto BuscarCaso;
+                                    }
+                                    else if (result.Contains("FALLO: Tipo de línea no detectado (ni Prepago ni Postpago)."))
+                                    {
+                                        log.Escribir("La línea asociada a la identifición no tiene tipo de línea (Prepago/Postpago).");
+                                        Console.WriteLine("La línea asociada a la identifición no tiene tipo de línea (Prepago/Postpago).");
+                                        _casoRepo.ActualizarEstado(
+                                            caso.Id_Lecturabilidad,
+                                            nuevoEstado: "RECHAZADO",
+                                            observaciones: $"Sin linea activa",
+                                            ExtraccionCompleta: caso.ExtraccionCompleta
+                                        );
+                                        goto BuscarCaso;
+                                    }
                                     else
                                     {
                                         throw new ACException($"Error: En AC.");
@@ -1443,6 +1826,7 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
                                             ; Intentar activar y traer al frente la ventana
                                             WinActivate, %WinTitle%
                                             WinWaitActive, %WinTitle%, , 5
+	                                
                                             ; Forzar Foreground
                                             WinExistId := WinExist(WinTitle)
                                             if (WinExistId)
@@ -1476,7 +1860,7 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
                                     throw new ACException($"Error: En AC.", ex);
                                 }
 
-                                if (caso.DirigidoA == "0")
+                                if (string.IsNullOrEmpty(caso.DirigidoA) || caso.DirigidoA == "0")
                                 {
                                     // Captura de nombre
                                     Thread.Sleep(3000);
@@ -1606,7 +1990,7 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
                                             log.Escribir("No se pudo extraer el nombre");
                                             Console.WriteLine("No se pudo extraer el nombre");
                                             throw new ACException($"Error: En AC.");
-                                        }  
+                                        }
                                         else if (result == "")
                                         {
                                             log.Escribir("Error critico! Al ejecutar script ahk");
@@ -1627,7 +2011,7 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
 
                                 }
 
-                                if (caso.CorreoaNotificar == "0")
+                                if (string.IsNullOrEmpty(caso.CorreoaNotificar) || caso.CorreoaNotificar == "0")
                                 {
                                     // Captura de correo
                                     Thread.Sleep(3000);
@@ -1757,7 +2141,7 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
                                     }
                                 }
 
-                                if (caso.Cuscode == "0")
+                                if (string.IsNullOrEmpty(caso.Cuscode) || caso.Cuscode == "0")
                                 {
 
                                     // Captura de Cuscode
@@ -1797,6 +2181,7 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
                                             Sleep, 500
                                             Clipboard := """"               ; limpiar clipboard
                                             Sleep, 1000
+                                            Send, {{Left 2}}
                                             ;MouseClick, left, 244, 92, 1
                                             Sleep, 1000
                                             Send, +{{Right 20}}
@@ -1841,7 +2226,7 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
                                         ahk.ExecRaw(scriptCuscode.ToString());
                                         Thread.Sleep(2000);
                                         result = ahk.GetVar("result");
-                                        
+
                                         if (result.Contains("OK")) // Asegúrate de que el resultado sea una cadena "true"
                                         {
                                             Console.WriteLine("OK");
@@ -1854,6 +2239,18 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
 
                                             // Guardar en DTO/objeto
                                             caso.Cuscode = custcode;
+
+                                            if (!string.IsNullOrEmpty(caso.Cuscode) && caso.Cuscode != "" && caso.Cuscode != "0")
+                                            {
+                                                CuscodeValido = ACHelper.IsValidCuscode(caso.Cuscode);
+                                            }
+
+                                            if (!CuscodeValido)
+                                            {
+                                                log.Escribir("Cuscode extraido no es valido.");
+                                                Console.WriteLine("Cuscode extraido no es valido.");
+                                                throw new ACException($"Error: Cuscode no es valido.");
+                                            }
 
                                             // Persistir Cuscode 
                                             try
@@ -1903,7 +2300,7 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
                                     }
                                 }
 
-                                if (caso.DirigidoA != "0" && caso.Identificacion != "0" && caso.CorreoaNotificar != "0")
+                                if (caso.DirigidoA != "0" && caso.Cuscode != "0" && caso.CorreoaNotificar != "0")
                                 {
                                     log.Escribir("Datos extraidos");
                                     Console.WriteLine("Datos extraidos");
@@ -1922,6 +2319,14 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
                             else
                             {
                                 //Devolver por datos incompletos
+                                _casoRepo.ActualizarEstado(
+                                    caso.Id_Lecturabilidad,
+                                    nuevoEstado: "RECHAZADO",
+                                    observaciones: $"Caso Rechazado por datos incompletos",
+                                    ExtraccionCompleta: caso.ExtraccionCompleta
+                                );
+
+                                goto BuscarCaso;
                             }
 
                         TerminarIntento:
@@ -1938,6 +2343,49 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
                                 );
                                 log.Escribir($"Caso: {caso.Id_Lecturabilidad} marcado como EXITOSO.");
                                 Thread.Sleep(2000);
+
+                                // Obtener el remitente a comprobar 
+                                remitente = (caso.CorreoaNotificar ?? string.Empty).Trim();
+
+                                // Normalizar: bajar a minúsculas y eliminar espacios laterales
+                                remitenteNorm = remitente.ToLowerInvariant();
+
+                                // Si el remitente está en la lista -> NO insertar
+                                if (!string.IsNullOrEmpty(remitente) && blockedSenders.Contains(remitenteNorm))
+                                {
+                                    log.Escribir($"Remitente bloqueado detectado para Id {caso.Id_Lecturabilidad}: {remitente} -> No se insertará en DetalleLecturabilidad. Atención manual requerida.");
+                                    Console.WriteLine($"Remitente bloqueado ({remitente}) — se omite InsertarDetalle para Id {caso.Id_Lecturabilidad}.");
+
+                                    // marcar el caso para revisión manual en lugar de dejarlo como EXITOSO.
+
+                                    _casoRepo.ActualizarEstado(
+                                        caso.Id_Lecturabilidad,
+                                        nuevoEstado: "RECHAZADO",
+                                        observaciones: $"Remitente bloqueado ({remitente}). Atención manual requerida.",
+                                        ExtraccionCompleta: caso.ExtraccionCompleta
+                                    );
+                                    log.Escribir($"Caso {caso.Id_Lecturabilidad} marcado como PENDIENTE_MANUAL por remitente bloqueado.");
+
+
+                                    // No llamamos a InsertarDetalle; salimos del flujo de inserción.
+                                }
+                                else 
+                                {
+                                    // remitente NO bloqueado -> proceder con la inserción
+                                    try
+                                    {
+                                        int filas = _actualizarCasoRepo.InsertarDetalle(caso.Id_Lecturabilidad);
+                                        Console.WriteLine($"InsertarDetalle: filas afectadas = {filas}");
+                                        log.Escribir($"InsertarDetalle: filas afectadas = {filas}");
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        Console.WriteLine("Fallo InsertarDetalle: " + ex.Message);
+                                        log.Escribir("Fallo InsertarDetalle: " + ex.Message);
+                                        throw;
+                                    }
+                                }
+
                                 tabular = 0; //reseteo
                                 procesoCompleto = true; // Marcar como completo para salir del bucle
                             }
@@ -2040,6 +2488,8 @@ namespace RPAExtraccionNotasRR.src.Rpa.RR.Core.Services
                 }
                 catch (Exception ex)
                 {
+                    _casoRepo.IncrementarIntento(caso.Id_Lecturabilidad);
+
                     _casoRepo.ActualizarEstado(
                                         caso.Id_Lecturabilidad,
                                         nuevoEstado: "FALLO_RPA",

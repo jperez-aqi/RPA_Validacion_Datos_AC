@@ -1,6 +1,7 @@
 ﻿using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using RPA_Validación_Datos_AC.src.Rpa.RR.Infrastructure.Repositories;
 using RPAExtraccionNotasRR.src.Rpa.RR.Core.Entities;
 using RPAExtraccionNotasRR.src.Rpa.RR.Core.Services;
 using RPAExtraccionNotasRR.src.Rpa.RR.Infrastructure.Email;
@@ -31,6 +32,11 @@ namespace Rpa.RR.ConsoleApp
                         new CredencialesRepository(
                             ctx.Configuration.GetConnectionString("ConnectionStringClaro"),
                             sp.GetRequiredService<IEmailSender>())); // Pass IEmailSender instance
+
+                        services.AddSingleton(sp =>
+                        new ActualizarCasoRepository(
+                            ctx.Configuration.GetConnectionString("DefaultConnection"),
+                            sp.GetRequiredService<IEmailSender>()));
 
                         services.AddSingleton(sp =>
                         new CasoRepository(ctx.Configuration.GetConnectionString("DefaultConnection")));
